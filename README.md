@@ -1,3 +1,7 @@
+# ありか — 空間の記憶を共有するアプリ
+
+各社への新規設置は [DEPLOYMENT.md](DEPLOYMENT.md) を参照してください。既存の稼働中Siteを更新する場合は、Site ID・保存先・管理用トークンを維持します。
+
 # vinext-starter
 
 A clean full-stack starter running on [vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and Drizzle support.

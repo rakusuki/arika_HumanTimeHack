@@ -2,17 +2,17 @@ import {issueSearchReceipt,readSearchReceipt} from '@/lib/search-receipt';
 import {MAX_FRAME_DATA_LENGTH, MAX_UPLOAD_LENGTH} from '@/lib/vision-config';
 import {mergeSearchLearning} from '@/lib/search-learning';
 import {searchScore} from '@/lib/search';
-import {analyze,adminToken,saveApiKey,apiKey,authorize,bucket,database,identity,reject,reply,textValue,type Frame,type Item} from '@/lib/server';
+import {analyze,budgetSettings,budgetCap,adminToken,saveApiKey,apiKey,authorize,bucket,database,identity,reject,reply,textValue,type Frame,type Item} from '@/lib/server';
 export const dynamic='force-dynamic';
 export async function GET(request:Request){try{const user=await identity(),d=database();const spaces=user==='creator'?(await d.prepare('SELECT * FROM spaces WHERE owner=? ORDER BY created DESC').bind(user).all()).results:(await d.prepare('SELECT * FROM spaces WHERE id=?').bind(user.slice(7)).all()).results;const space=new URL(request.url).searchParams.get('space');let captures:any[]=[],members=0,invite='',feedback:any[]=[];if(space){const s=await authorize(space,user);invite=s.owner===user?s.invite:'';captures=(await d.prepare('SELECT * FROM captures WHERE space=? ORDER BY created DESC LIMIT 50').bind(space).all()).results.map((c:any)=>({...c,frames:JSON.parse(c.frames),objects:JSON.parse(c.objects),canDelete:c.owner===user,owner:undefined}));members=Number((await d.prepare('SELECT COUNT(*) AS n FROM members WHERE space=?').bind(space).first<any>())?.n||0);feedback=(await d.prepare('SELECT found,intent,seconds,created FROM feedback WHERE space=? ORDER BY created DESC LIMIT 50').bind(space).all()).results;}
- const budget=await d.prepare('SELECT COALESCE(SUM(cost),0) AS total,SUM(CASE WHEN status!=? THEN 1 ELSE 0 END) AS unconfirmed FROM ledger').bind('completed').first();return reply({spaces:spaces.map((s:any)=>({id:s.id,name:s.name,isOwner:s.owner===user})),captures,members,invite,feedback,budget,aiReady:!!(await apiKey())});}catch(e){return reject(e);}}
+ const limits=await budgetSettings();const budget=await d.prepare('SELECT COALESCE(SUM(cost),0) AS total,SUM(CASE WHEN status!=? THEN 1 ELSE 0 END) AS unconfirmed FROM ledger').bind('completed').first();return reply({spaces:spaces.map((s:any)=>({id:s.id,name:s.name,isOwner:s.owner===user})),captures,members,invite,feedback,budget:{...budget,...limits},aiReady:!!(await apiKey())});}catch(e){return reject(e);}}
 export async function POST(request:Request){try{
  const origin=request.headers.get('origin');if(origin&&origin!==new URL(request.url).origin)return reply({error:'操作元を確認できませんでした。'},403);
  const d=database();if(Number(request.headers.get('content-length')||0)>MAX_UPLOAD_LENGTH)throw new Error('データが大きすぎます。画像数を減らしてください。');const raw=await request.text();if(raw.length>MAX_UPLOAD_LENGTH)throw new Error('データが大きすぎます。');const b=JSON.parse(raw);const action=b.action;
  if(action==='logout')return new Response('{}',{headers:{'Content-Type':'application/json','Set-Cookie':'arika_access=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0','Cache-Control':'no-store'}});
  if(action==='login'){
  const token=textValue(b.token,200);let owner=false;
- if(adminToken()&&token===adminToken()){owner=true;const existing=await d.prepare("SELECT id FROM spaces WHERE owner='creator'").first<any>();if(!existing){await d.batch([d.prepare('INSERT INTO spaces(id,name,owner,invite,created) VALUES(?,?,?,?,?)').bind('shared-space','共有スペース','creator',crypto.randomUUID().replaceAll('-',''),new Date().toISOString()),d.prepare('INSERT INTO members(space,user) VALUES(?,?)').bind('shared-space','creator'),d.prepare("INSERT OR IGNORE INTO config(key,value) VALUES('admin','creator')")]);}}
+ if(adminToken()&&token===adminToken()){owner=true;const existing=await d.prepare("SELECT id FROM spaces WHERE owner='creator'").first<any>();if(!existing){await d.batch([d.prepare('INSERT OR IGNORE INTO spaces(id,name,owner,invite,created) VALUES(?,?,?,?,?)').bind('shared-space','共有スペース','creator',crypto.randomUUID().replaceAll('-',''),new Date().toISOString()),d.prepare('INSERT OR IGNORE INTO members(space,user) VALUES(?,?)').bind('shared-space','creator'),d.prepare("INSERT OR IGNORE INTO config(key,value) VALUES('admin','creator')")]);}}
  else {const s=await d.prepare('SELECT id FROM spaces WHERE invite=?').bind(token).first();if(!s)throw new Error('招待リンクを確認してください。');}
  return new Response(JSON.stringify({ok:true,owner}),{headers:{'Content-Type':'application/json','Set-Cookie':`arika_access=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=604800`,'Cache-Control':'no-store'}});
  }
@@ -20,6 +20,17 @@ export async function POST(request:Request){try{
  if(action==='setkey'){if(user!=='creator')throw new Error('作成者のみ設定できます。');const key=textValue(b.key,500);if(!key.startsWith('sk-')||key.length<20)throw new Error('OpenAIのAPIキーを入力してください。');await saveApiKey(key);return reply({ok:true});}
  if(action==='create'||action==='join')throw new Error('招待リンクから共有スペースを開いてください。');
  const space=textValue(b.space,80);const s=await authorize(space,user);
+ if(action==='settings'){
+  if(s.owner!==user)throw new Error('組織設定は管理者のみ変更できます。');
+  const name=textValue(b.name,80),limit=b.budgetLimit,cap=budgetCap();
+  if(!name)throw new Error('組織・スペース名を入力してください。');
+  if(typeof limit!=='number'||!Number.isFinite(limit)||limit<0||limit>cap||Math.abs(limit*100-Math.round(limit*100))>0.000001)throw new Error(`AI利用上限は0〜${cap}ドルの範囲で、小数第2位まで入力してください。`);
+  await d.batch([
+   d.prepare('UPDATE spaces SET name=? WHERE id=? AND owner=?').bind(name,space,user),
+   d.prepare("INSERT INTO config(key,value) VALUES('budget_limit',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(String(limit))
+  ]);
+  return reply({ok:true});
+ }
  if(['save','delete','deleteFrame','rotate','edit'].includes(action)&&s.owner!==user)throw new Error('記録の追加・変更・削除は作成者のみ利用できます。');
  if(action==='analyze'&&!textValue(b.query)&&s.owner!==user)throw new Error('初回解析は作成者のみ利用できます。');
  if(action==='edit'){const id=textValue(b.capture,80),label=textValue(b.label,80),notes=textValue(b.notes,500);if(!label)throw new Error('撮影場所を入力してください。');const c=await d.prepare('SELECT objects FROM captures WHERE id=? AND space=? AND owner=?').bind(id,space,user).first<any>();if(!c)throw new Error('記録が見つかりません。');const objects=JSON.parse(c.objects).filter((o:Item)=>o.source!=='手動');if(notes)objects.unshift({name:notes,description:'撮影者のメモ',location:label,frame:0,source:'手動'});const changed=await d.prepare('UPDATE captures SET label=?,objects=? WHERE id=? AND objects=?').bind(label,JSON.stringify(objects),id,c.objects).run();if(!changed.meta.changes)throw new Error('記録が更新されました。開き直して再試行してください。');return reply({ok:true});}

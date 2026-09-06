@@ -105,3 +105,5 @@ body { background: var(--background); color: var(--foreground); font-family: -ap
 .recheck-status:empty{display:none}
 
 .saved-image-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.saved-image-item{min-width:0;display:flex;flex-direction:column;gap:6px}.saved-image-thumb{border:2px solid transparent;border-radius:8px;overflow:hidden;background:#f3f6fc;text-align:left}.saved-image-thumb[aria-pressed=true]{border-color:#244ee8}.saved-image-thumb img{display:block;width:100%;height:95px;object-fit:contain}.saved-image-thumb span{display:block;padding:4px;font-size:14px}.saved-image-item button{white-space:normal}.delete-image-preview{display:block;max-height:35vh;width:100%;object-fit:contain}@media(max-width:540px){.saved-image-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
+.setup-notice p{margin:0 0 12px}.api-settings label{display:grid;gap:8px;text-align:left}.api-settings input{width:100%}

@@ -15,13 +15,26 @@ export function textValue(v:unknown,max=200){return typeof v==='string'?v.trim()
 export type Frame={id:string;time:number};
 export type Item={name:string;description:string;location:string;frame:number;box?:number[];source?:string;aliases?:string[];learnedQueries?:string[]};
 export function validateItems(raw:unknown,count:number):Item[]{if(!Array.isArray(raw))return [];return raw.slice(0,80).flatMap((x:any)=>{if(!x||typeof x!=='object'||!textValue(x.name)||!Number.isInteger(x.frame)||x.frame<0||x.frame>=count)return [];let box=Array.isArray(x.box)&&x.box.length===4&&x.box.every((n:unknown)=>typeof n==='number'&&Number.isFinite(n))?x.box.map((n:number)=>Math.max(0,Math.min(1,n))):undefined;if(box&&(box[2]<=box[0]||box[3]<=box[1]))box=undefined;return [{name:textValue(x.name,80),description:textValue(x.description,300),location:textValue(x.location,200),frame:x.frame,box,aliases:Array.isArray(x.aliases)?[...new Set<string>(x.aliases.map((a:unknown)=>textValue(a,60)).filter(Boolean))].slice(0,8):[],source:'AI'}];});}
+// Each installation has its own DB, bucket, admin token and lifetime budget.
+export function budgetCap(){
+ const raw=(env as unknown as Record<string,string>).AI_BUDGET_CAP;
+ if(raw===undefined||raw==='')return 4.5;
+ const cap=Number(raw);
+ // Invalid deployment configuration stops AI instead of silently raising spend.
+ return Number.isFinite(cap)&&cap>=0&&cap<=10000?Math.floor(cap*100)/100:0;
+}
+export async function budgetSettings(){
+ const cap=budgetCap(),row=await database().prepare("SELECT value FROM config WHERE key='budget_limit'").first<any>();
+ const saved=row?Number(row.value):cap;
+ return {cap,limit:Number.isFinite(saved)&&saved>=0?Math.min(cap,saved):0};
+}
 export async function analyze(space:string,frames:Frame[],query=''){
  const key=await apiKey();if(!key)throw new Error('AI解析は未接続です。撮影の保存と手動メモは利用できます。');
- const d=database();const spaceRow=await d.prepare('SELECT owner FROM spaces WHERE id=?').bind(space).first<any>();const admin=await d.prepare("SELECT value FROM config WHERE key='admin'").first<any>();if(!admin||spaceRow?.owner!==admin.value)throw new Error('このモックでは運営者が作成したスペースのみAIを利用できます。');
+ const d=database();const spaceRow=await d.prepare('SELECT owner FROM spaces WHERE id=?').bind(space).first<any>();const admin=await d.prepare("SELECT value FROM config WHERE key='admin'").first<any>();if(!admin||spaceRow?.owner!==admin.value)throw new Error('この組織の管理者が設定したスペースのみAIを利用できます。');
  if(frames.length<1||frames.length>12)throw new Error('画像は1〜12枚で解析してください。');
- const id=crypto.randomUUID(),reserve=visionReserve(frames.length);
+ const id=crypto.randomUUID(),reserve=visionReserve(frames.length),cap=budgetCap();
  // Reserve all batches atomically before any request, including concurrent visitors.
- const held=await d.prepare("INSERT INTO ledger(id,space,kind,cost,status,created) SELECT ?,?,?,?,?,? WHERE (SELECT COALESCE(SUM(cost),0) FROM ledger)+?<=4.5").bind(id,space,query?'再解析':'初回解析',reserve,'reserved',new Date().toISOString(),reserve).run();
+ const held=await d.prepare("INSERT INTO ledger(id,space,kind,cost,status,created) SELECT ?,?,?,?,?,? WHERE (SELECT COALESCE(SUM(cost),0) FROM ledger)+?<=MIN(?,COALESCE(CAST((SELECT value FROM config WHERE key='budget_limit') AS REAL),?))").bind(id,space,query?'再解析':'初回解析',reserve,'reserved',new Date().toISOString(),reserve,cap,cap).run();
  if(!held.meta.changes)throw new Error('予算保護のためAIを停止しました。保存済みの記録は検索できます。');
  let cost=0,input=0,output=0,unconfirmed=false,inFlight=false;
  const objects:Item[]=[];

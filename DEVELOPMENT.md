@@ -9,13 +9,13 @@ The private management link supplies an ADMIN_TOKEN through a URL fragment, exch
 Enter an OpenAI API key in the creator's Shared tab. The key is encrypted with AES-GCM under a key derived from the runtime ADMIN_TOKEN. Rotating ADMIN_TOKEN requires reentering the API key. Optional runtime OPENAI_API_KEY takes precedence. Actual keys must never be committed.
 
 ## Capture and search
-Safari uploads a selected video (<=90 seconds, <=150 MB) or up to12 photos. Local canvas extraction produces at most12 JPEG frames, longest edge768px. The user reviews frames and confirms capture time before saving. Only those frames are uploaded. Original video is not retained. Uniform sampling can miss fleeting or obscured objects and does not constitute analysis of every frame or physical 3D location.
+Safari uploads a selected video (<=90 seconds, <=150 MB) or up to12 photos. Local canvas extraction produces at most12 JPEG frames, longest edge1536px. The user reviews frames and confirms capture time before saving. Only those frames are uploaded. Original video is not retained. Up to three candidates per time interval are ranked for sharpness; excluded frames are replenished from unused candidates. Sampling can miss fleeting or obscured objects and does not constitute analysis of every frame or physical 3D location.
 
 Initial gpt-4.1-mini analysis produces visible-object labels, descriptions, relative location and approximate image boxes. Saved-record search is deterministic keyword matching plus a small synonym list, with no per-search API charge. Optional question-conditioned reinspection sends all extracted images of one selected capture to the API. Responses are grounded in source images; malformed object/frame/box data is filtered. Unknown results remain unknown.
 
 ## Budget and evaluation
 Public standard pricing reference: https://developers.openai.com/api/docs/models/gpt-4.1-mini
-Input $0.40/M, output $1.60/M. Full input rate used conservatively even if cached. Cost is an estimate, not an invoice. Each paid call atomically reserves $0.05 in D1 with an app-wide $4.50 ceiling, preserving $0.50 from the user's $5 total budget. Failed/unknown calls retain their reservation. Recorded provider usage replaces the reservation. This applies to this app only; other uses of the user's key are outside its control.
+Input $0.40/M, output $1.60/M. Full input rate used conservatively even if cached. Cost is an estimate, not an invoice. Each three-image batch reserves $0.05 in D1 against the installation's cumulative budget (default $4.50, preserving $0.50 from the original $5 budget). Administrators can set a lower operational limit; the deployment AI_BUDGET_CAP bounds it. Changing settings never resets usage. Failed/unknown calls retain their reservation. Recorded provider usage replaces the reservation. This applies to this app only; other uses of the user's key are outside its control.
 
 The feedback screen records reported real-object finding, elapsed time from search to feedback, and intended next activity. It does not infer causal time savings or measured Human Time gains.
 
@@ -33,6 +33,9 @@ The Sites build compiles the production Worker. Real iPhone Safari capture, real
 6. If no candidate, select a capture for AI reinspection; show real response time/cost.
 7. Locate the real object and record what meaningful work to return to.
 8. Try an absent object; explain blind spots and last-seen boundary.
+
+## Installation settings
+See DEPLOYMENT.md for isolated company installation, secure administrator provisioning and initially empty API configuration. Existing installations retain the same Site ID, tokens, storage and default budget.
 
 ## Delivery discipline
 Freeze a demo-stable Git tag for the published revision. Continue subsequent changes on a development branch; do not overwrite deployed migrations. Time-critical changes should be bounded and rechecked before publication.

@@ -126,3 +126,63 @@ test('Saved image deletion preserves evidence, rejects viewers and protects the 
  assert.equal(objects.has(frames[2].id),true);
  await call({action:'delete',space:'shared-space',capture:id});
 });
+
+test('Company settings preserve existing links, encrypted key, captures and accumulated charges',async()=>{
+ globalThis.__cookie='a'.repeat(64);
+ const before={space:sql.prepare("SELECT * FROM spaces WHERE id='shared-space'").get(),captures:sql.prepare('SELECT * FROM captures ORDER BY id').all(),ledger:sql.prepare('SELECT * FROM ledger ORDER BY id').all(),key:sql.prepare("SELECT value FROM config WHERE key='api_key'").get().value};
+ const data=await (await api.GET(new Request('https://arika.test/api/workspace?space=shared-space'))).json();
+ assert.equal(data.budget.limit,4.5);assert.equal(data.budget.cap,4.5);
+ for(const limit of [-1,4.51,'2',null,1.001])assert.equal((await call({action:'settings',space:'shared-space',name:'会社A',budgetLimit:limit})).status,400);
+ globalThis.__cookie=before.space.invite;
+ assert.equal((await call({action:'settings',space:'shared-space',name:'乗っ取り',budgetLimit:0})).status,400);
+ globalThis.__cookie='a'.repeat(64);
+ assert.equal((await call({action:'settings',space:'shared-space',name:'会社A',budgetLimit:2})).status,200);
+ assert.equal((await call({action:'login',token:'a'.repeat(64)})).status,200);
+ const after=sql.prepare("SELECT * FROM spaces WHERE id='shared-space'").get();
+ assert.deepEqual({...after,name:before.space.name},{...before.space});assert.equal(after.name,'会社A');
+ assert.deepEqual(sql.prepare('SELECT * FROM captures ORDER BY id').all(),before.captures);
+ assert.deepEqual(sql.prepare('SELECT * FROM ledger ORDER BY id').all(),before.ledger);
+ assert.equal(sql.prepare("SELECT value FROM config WHERE key='api_key'").get().value,before.key);
+ assert.equal((await call({action:'login',token:before.space.invite})).status,200);
+ const next=await (await api.GET(new Request('https://arika.test/api/workspace?space=shared-space'))).json();assert.equal(next.budget.limit,2);assert.equal(next.budget.total,data.budget.total);assert.equal(next.aiReady,true);
+});
+
+test('Fresh companies start without a key, retain manual search, isolate credentials/data, and enforce custom budgets',async()=>{
+ const original={...globalThis.__env},oldCookie=globalThis.__cookie,realFetch=globalThis.fetch;let calls=0;
+ const fresh=()=>{
+  const db=new DatabaseSync(':memory:');db.exec(readFileSync(new URL('../drizzle/0000_clever_triton.sql',import.meta.url),'utf8').replaceAll('--> statement-breakpoint',''));
+  const prepare=(query,args=[])=>({bind(...v){return prepare(query,v);},async first(){return db.prepare(query).get(...args)||null;},async all(){return {results:db.prepare(query).all(...args)};},async run(){const r=db.prepare(query).run(...args);return {meta:{changes:Number(r.changes)}};}});
+  const images=new Map();return {db,env:{ADMIN_TOKEN:crypto.randomUUID().replaceAll('-','')+crypto.randomUUID().replaceAll('-',''),DB:{prepare,async batch(stmts){db.exec('BEGIN');try{const out=[];for(const stmt of stmts)out.push(await stmt.run());db.exec('COMMIT');return out;}catch(e){db.exec('ROLLBACK');throw e;}}},BUCKET:{async put(k,v){images.set(k,v);},async get(k){const v=images.get(k);return v?{body:v,async arrayBuffer(){return v.buffer;}}:null;},async delete(k){images.delete(k);}}}};
+ };
+ const a=fresh(),b=fresh();
+ const select=(company)=>{for(const key of Object.keys(globalThis.__env))delete globalThis.__env[key];Object.assign(globalThis.__env,company.env);globalThis.__cookie='';};
+ globalThis.fetch=async()=>{calls++;return Response.json({usage:{prompt_tokens:1000,completion_tokens:100},choices:[{finish_reason:'stop',message:{content:'{"objects":[]}'}}]});};
+ try{
+  select(a);
+  assert.equal((await call({action:'login',token:''})).status,400);
+  assert.equal((await call({action:'login',token:a.env.ADMIN_TOKEN})).status,200);globalThis.__cookie=a.env.ADMIN_TOKEN;
+  let d=await (await api.GET(new Request('https://arika.test/api/workspace?space=shared-space'))).json();
+  assert.equal(d.aiReady,false);assert.equal(d.captures.length,0);assert.equal(d.budget.total,0);assert.equal(d.budget.limit,4.5);const inviteA=d.invite;
+  const saved=await call({action:'save',space:'shared-space',label:'会社A',notes:'赤いはさみ',frames:[{data:'data:image/jpeg;base64,/9j/2Q==',time:1}]});assert.equal(saved.status,200);
+  assert.equal((await call({action:'search',space:'shared-space',query:'はさみ'})).data.results.length,1);
+  assert.equal((await call({action:'analyze',space:'shared-space',capture:saved.data.id})).status,400);assert.equal(calls,0);
+  assert.equal((await call({action:'settings',space:'shared-space',name:'会社A',budgetLimit:0.05})).status,200);
+  assert.equal((await call({action:'setkey',key:'sk-'+ 'test'.repeat(10)})).status,200);
+  const concurrent=await Promise.all([call({action:'analyze',space:'shared-space',capture:saved.data.id}),call({action:'analyze',space:'shared-space',capture:saved.data.id})]);
+  assert.deepEqual(concurrent.map(r=>r.status).sort(),[200,400]);assert.equal(calls,1);
+  const spent=a.db.prepare('SELECT SUM(cost) AS n FROM ledger').get().n;assert.ok(spent>0);
+  await call({action:'settings',space:'shared-space',name:'会社A',budgetLimit:0});
+  assert.equal((await call({action:'analyze',space:'shared-space',capture:saved.data.id})).status,400);assert.equal(calls,1);
+  assert.equal(a.db.prepare('SELECT SUM(cost) AS n FROM ledger').get().n,spent);
+  select(b);globalThis.__env.AI_BUDGET_CAP='20';
+  assert.equal((await call({action:'login',token:a.env.ADMIN_TOKEN})).status,400);assert.equal((await call({action:'login',token:inviteA})).status,400);
+  await call({action:'login',token:b.env.ADMIN_TOKEN});globalThis.__cookie=b.env.ADMIN_TOKEN;
+  d=await (await api.GET(new Request('https://arika.test/api/workspace?space=shared-space'))).json();
+  assert.equal(d.aiReady,false);assert.equal(d.captures.length,0);assert.equal(d.budget.total,0);assert.equal(d.budget.cap,20);assert.notEqual(d.invite,inviteA);
+  assert.equal((await call({action:'settings',space:'shared-space',name:'会社B',budgetLimit:10})).status,200);
+  assert.equal((await call({action:'search',space:'shared-space',query:'はさみ'})).data.results.length,0);
+  globalThis.__env.AI_BUDGET_CAP='invalid';d=await (await api.GET(new Request('https://arika.test/api/workspace'))).json();assert.equal(d.budget.limit,0);
+  select(a);assert.equal((await call({action:'login',token:inviteA})).status,200);globalThis.__cookie=inviteA;
+  assert.equal((await call({action:'search',space:'shared-space',query:'はさみ'})).data.results.length,1);
+ }finally{for(const key of Object.keys(globalThis.__env))delete globalThis.__env[key];Object.assign(globalThis.__env,original);globalThis.__cookie=oldCookie;globalThis.fetch=realFetch;a.db.close();b.db.close();}
+});
