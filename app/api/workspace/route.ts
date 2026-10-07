@@ -1,25 +1,33 @@
+import {listMissingReports,submitMissingReport,resolveMissingReports} from '@/lib/missing-reports';
+import {requireAdministrator,issueClient,boundedBody} from '@/lib/security';
 import {issueSearchReceipt,readSearchReceipt} from '@/lib/search-receipt';
 import {MAX_FRAME_DATA_LENGTH, MAX_UPLOAD_LENGTH} from '@/lib/vision-config';
 import {mergeSearchLearning} from '@/lib/search-learning';
 import {searchScore} from '@/lib/search';
-import {analyze,budgetSettings,budgetCap,adminToken,saveApiKey,apiKey,authorize,bucket,database,identity,reject,reply,textValue,type Frame,type Item} from '@/lib/server';
+import {analyze,enforceRate,budgetSettings,budgetCap,adminToken,saveApiKey,apiKey,authorize,bucket,database,identity,reject,reply,textValue,type Frame,type Item} from '@/lib/server';
 export const dynamic='force-dynamic';
-export async function GET(request:Request){try{const user=await identity(),d=database();const spaces=user==='creator'?(await d.prepare('SELECT * FROM spaces WHERE owner=? ORDER BY created DESC').bind(user).all()).results:(await d.prepare('SELECT * FROM spaces WHERE id=?').bind(user.slice(7)).all()).results;const space=new URL(request.url).searchParams.get('space');let captures:any[]=[],members=0,invite='',feedback:any[]=[];if(space){const s=await authorize(space,user);invite=s.owner===user?s.invite:'';captures=(await d.prepare('SELECT * FROM captures WHERE space=? ORDER BY created DESC LIMIT 50').bind(space).all()).results.map((c:any)=>({...c,frames:JSON.parse(c.frames),objects:JSON.parse(c.objects),canDelete:c.owner===user,owner:undefined}));members=Number((await d.prepare('SELECT COUNT(*) AS n FROM members WHERE space=?').bind(space).first<any>())?.n||0);feedback=(await d.prepare('SELECT found,intent,seconds,created FROM feedback WHERE space=? ORDER BY created DESC LIMIT 50').bind(space).all()).results;}
- const limits=await budgetSettings();const budget=await d.prepare('SELECT COALESCE(SUM(cost),0) AS total,SUM(CASE WHEN status!=? THEN 1 ELSE 0 END) AS unconfirmed FROM ledger').bind('completed').first();return reply({spaces:spaces.map((s:any)=>({id:s.id,name:s.name,isOwner:s.owner===user})),captures,members,invite,feedback,budget:{...budget,...limits},aiReady:!!(await apiKey())});}catch(e){return reject(e);}}
+export async function GET(request:Request){try{const user=await identity(),d=database();const spaces=user==='creator'?(await d.prepare('SELECT * FROM spaces WHERE owner=? ORDER BY created DESC').bind(user).all()).results:(await d.prepare('SELECT * FROM spaces WHERE id=?').bind(user.slice(7)).all()).results;const space=new URL(request.url).searchParams.get('space');let captures:any[]=[],members=0,invite='',feedback:any[]=[],reportData:{reports:unknown[];reportPendingCount:number}={reports:[],reportPendingCount:0};if(space){const s=await authorize(space,user);invite=s.owner===user?s.invite:'';if(s.owner===user)reportData=await listMissingReports(space);captures=(await d.prepare('SELECT * FROM captures WHERE space=? ORDER BY created DESC LIMIT 50').bind(space).all()).results.map((c:any)=>({...c,frames:JSON.parse(c.frames),objects:JSON.parse(c.objects),canDelete:c.owner===user,owner:undefined}));members=Number((await d.prepare('SELECT COUNT(*) AS n FROM members WHERE space=?').bind(space).first<any>())?.n||0);feedback=(await d.prepare('SELECT found,intent,seconds,created FROM feedback WHERE space=? ORDER BY created DESC LIMIT 50').bind(space).all()).results;}
+ const limits=await budgetSettings();const budget=await d.prepare('SELECT COALESCE(SUM(cost),0) AS total,SUM(CASE WHEN status!=? THEN 1 ELSE 0 END) AS unconfirmed FROM ledger').bind('completed').first();return reply({spaces:spaces.map((s:any)=>({id:s.id,name:s.name,isOwner:s.owner===user})),captures,members,invite,feedback,...reportData,budget:{...budget,...limits},aiReady:!!(await apiKey())});}catch(e){return reject(e);}}
 export async function POST(request:Request){try{
- const origin=request.headers.get('origin');if(origin&&origin!==new URL(request.url).origin)return reply({error:'操作元を確認できませんでした。'},403);
- const d=database();if(Number(request.headers.get('content-length')||0)>MAX_UPLOAD_LENGTH)throw new Error('データが大きすぎます。画像数を減らしてください。');const raw=await request.text();if(raw.length>MAX_UPLOAD_LENGTH)throw new Error('データが大きすぎます。');const b=JSON.parse(raw);const action=b.action;
- if(action==='logout')return new Response('{}',{headers:{'Content-Type':'application/json','Set-Cookie':'arika_access=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0','Cache-Control':'no-store'}});
+ const origin=request.headers.get('origin');if(origin!==new URL(request.url).origin)return reply({error:'操作元を確認できませんでした。'},403);
+ const d=database();if(Number(request.headers.get('content-length')||0)>MAX_UPLOAD_LENGTH)throw new Error('データが大きすぎます。画像数を減らしてください。');const raw=await boundedBody(request,MAX_UPLOAD_LENGTH);if(raw.length>MAX_UPLOAD_LENGTH)throw new Error('データが大きすぎます。');const b=JSON.parse(raw);const action=b.action;
+ if(action==='logout'){const response=reply({ok:true});for(const name of ['arika_access','arika_client'])response.headers.append('Set-Cookie',`${name}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`);return response;}
  if(action==='login'){
+ await enforceRate('login:global',60,60);
  const token=textValue(b.token,200);let owner=false;
- if(adminToken()&&token===adminToken()){owner=true;const existing=await d.prepare("SELECT id FROM spaces WHERE owner='creator'").first<any>();if(!existing){await d.batch([d.prepare('INSERT OR IGNORE INTO spaces(id,name,owner,invite,created) VALUES(?,?,?,?,?)').bind('shared-space','共有スペース','creator',crypto.randomUUID().replaceAll('-',''),new Date().toISOString()),d.prepare('INSERT OR IGNORE INTO members(space,user) VALUES(?,?)').bind('shared-space','creator'),d.prepare("INSERT OR IGNORE INTO config(key,value) VALUES('admin','creator')")]);}}
+ if(adminToken()&&token===adminToken()){await requireAdministrator();owner=true;const existing=await d.prepare("SELECT id FROM spaces WHERE owner='creator'").first<any>();if(!existing){await d.batch([d.prepare('INSERT OR IGNORE INTO spaces(id,name,owner,invite,created) VALUES(?,?,?,?,?)').bind('shared-space','共有スペース','creator',crypto.randomUUID().replaceAll('-',''),new Date().toISOString()),d.prepare('INSERT OR IGNORE INTO members(space,user) VALUES(?,?)').bind('shared-space','creator'),d.prepare("INSERT OR IGNORE INTO config(key,value) VALUES('admin','creator')")]);}}
  else {const s=await d.prepare('SELECT id FROM spaces WHERE invite=?').bind(token).first();if(!s)throw new Error('招待リンクを確認してください。');}
- return new Response(JSON.stringify({ok:true,owner}),{headers:{'Content-Type':'application/json','Set-Cookie':`arika_access=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=604800`,'Cache-Control':'no-store'}});
+ const response=reply({ok:true,owner});
+ response.headers.append('Set-Cookie',`arika_access=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=604800`);
+ response.headers.append('Set-Cookie',`arika_client=${await issueClient()}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=604800`);
+ return response;
  }
  const user=await identity();
  if(action==='setkey'){if(user!=='creator')throw new Error('作成者のみ設定できます。');const key=textValue(b.key,500);if(!key.startsWith('sk-')||key.length<20)throw new Error('OpenAIのAPIキーを入力してください。');await saveApiKey(key);return reply({ok:true});}
  if(action==='create'||action==='join')throw new Error('招待リンクから共有スペースを開いてください。');
  const space=textValue(b.space,80);const s=await authorize(space,user);
+ if(action==='reportMissing'){await enforceRate('report:'+space,30,60);return reply(await submitMissingReport(space,user,b));}
+ if(action==='resolveReports'){if(s.owner!==user)throw new Error('報告への対応は管理者のみ利用できます。');return reply(await resolveMissingReports(space,b.ids));}
  if(action==='settings'){
   if(s.owner!==user)throw new Error('組織設定は管理者のみ変更できます。');
   const name=textValue(b.name,80),limit=b.budgetLimit,cap=budgetCap();
@@ -49,12 +57,13 @@ export async function POST(request:Request){try{
  }
  if(action==='analyze'||action==='delete'){
  const capture=await d.prepare('SELECT * FROM captures WHERE id=? AND space=?').bind(textValue(b.capture,80),space).first<any>();if(!capture)throw new Error('記録が見つかりません。');if(action==='delete'){if(capture.owner!==user)throw new Error('削除できるのは撮影者のみです。');await d.prepare('DELETE FROM captures WHERE id=?').bind(capture.id).run();for(const f of JSON.parse(capture.frames))await bucket().delete(f.id);return reply({ok:true});}
- const q=textValue(b.query,180);const result=await analyze(space,JSON.parse(capture.frames),q);
+ const q=textValue(b.query,180);const result=await analyze(space,JSON.parse(capture.frames),q,user);
  if(!q){const kept=JSON.parse(capture.objects).filter((x:Item)=>x.source==='手動'||x.learnedQueries?.length);const changed=await d.prepare('UPDATE captures SET objects=?,mode=? WHERE id=? AND frames=? AND objects=?').bind(JSON.stringify(mergeSearchLearning(kept,result.objects,'')),'ai',capture.id,capture.frames,capture.objects).run();if(!changed.meta.changes)throw new Error('解析中に撮影記録が変更されました。最新の記録から再試行してください。');}
  const latest=await d.prepare('SELECT frames FROM captures WHERE id=? AND space=?').bind(capture.id,space).first<any>();if(!latest||latest.frames!==capture.frames)throw new Error('検索中に撮影画像が変更されました。最新の記録から再試行してください。');const receipt=q&&result.objects.length?await issueSearchReceipt({space,user,capture:capture.id,query:q,frames:JSON.parse(capture.frames),objects:result.objects}):'';return reply({...result,capture:capture.id,receipt});
  }
  if(action==='search'){const q=textValue(b.query,180);if(!q)throw new Error('探したいモノを入力してください。');const rows=(await d.prepare('SELECT * FROM captures WHERE space=? ORDER BY created DESC LIMIT 50').bind(space).all()).results;const results:any[]=[];for(const c of rows as any[]){const frames=JSON.parse(c.frames);for(const o of JSON.parse(c.objects)){const score=searchScore(q,o,c.label);if(score)results.push({...o,capture:c.id,label:c.label,created:c.created,image:frames[o.frame]?.id,time:frames[o.frame]?.time,score});}}results.sort((a,b)=>b.score-a.score);return reply({results:results.slice(0,30),cost:0,mode:'保存済み記録の検索'});}
  if(action==='feedback'){
+ await enforceRate('feedback:'+space,60,60);
  let learned=false;
  if(b.found===true&&b.receipt){
   if(typeof b.receipt!=='string')throw new Error('検索結果を確認してください。');

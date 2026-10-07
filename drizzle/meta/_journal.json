@@ -8,6 +8,20 @@
       "when": 1788658343593,
       "tag": "0000_clever_triton",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1788684977232,
+      "tag": "0001_amused_karnak",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1791348195459,
+      "tag": "0002_skinny_stryfe",
+      "breakpoints": true
     }
   ]
 }

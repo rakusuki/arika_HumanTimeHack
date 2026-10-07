@@ -1,12 +1,12 @@
 # ありか — Human Time Hackathon mock
 
 ## Product boundary
-One shared space. Creator-only capture, initial analysis, editing and deletion. Bearer invitation allows read/search and bounded AI reinspection without a ChatGPT account. Identity and authorization are centralized in lib/server.ts so account-backed identities can replace invitation capabilities later.
+One shared space. Creator-only capture, initial analysis, editing and deletion. Bearer invitation allows read/search and bounded AI reinspection without a ChatGPT account. Identity and authorization are centralized in lib/server.ts with administrator account verification in lib/security.ts.
 
 ## Operations
-The private management link supplies an ADMIN_TOKEN through a URL fragment, exchanged for a Secure/HttpOnly/SameSite=Lax cookie. Do not share the management link. Visitors use a separate random invitation. Rotation invalidates existing visitor cookies. No tokens appear in source code, links in API responses to visitors, or server-side URLs. The page disables indexing and referrer forwarding.
+The private management link supplies an ADMIN_TOKEN through a URL fragment, exchanged for a Secure/HttpOnly/SameSite=Lax cookie only after Sites-authenticated ChatGPT identity matches ADMIN_EMAILS. Every administrator request checks the allowlist again. Do not share the management link. Visitors use a separate random invitation. Rotation invalidates existing visitor cookies. No tokens appear in source code, links in API responses to visitors, or server-side URLs. The page disables indexing and referrer forwarding.
 
-Enter an OpenAI API key in the creator's Shared tab. The key is encrypted with AES-GCM under a key derived from the runtime ADMIN_TOKEN. Rotating ADMIN_TOKEN requires reentering the API key. Optional runtime OPENAI_API_KEY takes precedence. Actual keys must never be committed.
+Enter an OpenAI API key in the creator's Shared tab. The key is encrypted with AES-GCM using an independent API_ENCRYPTION_KEY. Legacy ciphertext is lazily migrated before ADMIN_TOKEN rotation; verify version 2 before changing the old token. After migration, token rotation preserves the API key. Optional runtime OPENAI_API_KEY takes precedence. Actual keys must never be committed.
 
 ## Capture and search
 Safari uploads a selected video (<=90 seconds, <=150 MB) or up to12 photos. Local canvas extraction produces at most12 JPEG frames, longest edge1536px. The user reviews frames and confirms capture time before saving. Only those frames are uploaded. Original video is not retained. Up to three candidates per time interval are ranked for sharpness; excluded frames are replenished from unused candidates. Sampling can miss fleeting or obscured objects and does not constitute analysis of every frame or physical 3D location.
@@ -39,3 +39,5 @@ See DEPLOYMENT.md for isolated company installation, secure administrator provis
 
 ## Delivery discipline
 Freeze a demo-stable Git tag for the published revision. Continue subsequent changes on a development branch; do not overwrite deployed migrations. Time-critical changes should be bounded and rechecked before publication.
+
+Security controls, dependency audit limitations and incident procedures: see SECURITY.md and DEPLOYMENT.md.

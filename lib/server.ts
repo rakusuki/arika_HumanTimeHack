@@ -1,16 +1,31 @@
+import {SecurityError,encryptionSecret,requireAdministrator,rateActor} from './security';
 import {VISION_BATCH_SIZE, VISION_BATCH_RESERVE, visionReserve} from './vision-config';
 import { env } from 'cloudflare:workers';
 import { cookies } from 'next/headers';
 export function database(){if(!env.DB)throw new Error('保存先に接続できません。少し待って再試行してください。');return env.DB;}
 export function bucket(){if(!env.BUCKET)throw new Error('画像の保存先に接続できません。');return env.BUCKET;}
 export function adminToken(){return (env as unknown as Record<string,string>).ADMIN_TOKEN||'';}
-async function encryptionKey(){const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(adminToken()));return crypto.subtle.importKey('raw',digest,'AES-GCM',false,['encrypt','decrypt']);}
-export async function saveApiKey(value:string){const iv=crypto.getRandomValues(new Uint8Array(12));const encrypted=await crypto.subtle.encrypt({name:'AES-GCM',iv},await encryptionKey(),new TextEncoder().encode(value));const payload=JSON.stringify({iv:Array.from(iv),data:Array.from(new Uint8Array(encrypted))});await database().prepare("INSERT INTO config(key,value) VALUES('api_key',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(payload).run();}
-export async function apiKey(){const key=(env as unknown as Record<string,string>).OPENAI_API_KEY;if(key)return key;const row=await database().prepare("SELECT value FROM config WHERE key='api_key'").first<any>();if(!row)return '';try{const p=JSON.parse(row.value);const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:new Uint8Array(p.iv)},await encryptionKey(),new Uint8Array(p.data));return new TextDecoder().decode(plain);}catch{return '';}}
-export async function identity(){const c=await cookies();const token=c.get('arika_access')?.value;if(!token)throw new Error('招待リンクまたは管理用リンクから開いてください。');if(adminToken()&&token===adminToken())return 'creator';const row=await database().prepare('SELECT id FROM spaces WHERE invite=?').bind(token).first<any>();if(row)return 'viewer:'+row.id;throw new Error('リンクの有効期限が切れたか、共有が解除されました。新しい招待リンクから開いてください。');}
+async function encryptionKey(secret:string){const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(secret));return crypto.subtle.importKey('raw',digest,'AES-GCM',false,['encrypt','decrypt']);}
+async function encryptedPayload(value:string){const iv=crypto.getRandomValues(new Uint8Array(12));const encrypted=await crypto.subtle.encrypt({name:'AES-GCM',iv},await encryptionKey(encryptionSecret()),new TextEncoder().encode(value));return JSON.stringify({version:2,iv:Array.from(iv),data:Array.from(new Uint8Array(encrypted))});}
+export async function saveApiKey(value:string){const payload=await encryptedPayload(value);await database().prepare("INSERT INTO config(key,value) VALUES('api_key',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(payload).run();}
+export async function apiKey(){
+ const key=(env as unknown as Record<string,string>).OPENAI_API_KEY;if(key)return key;
+ const row=await database().prepare("SELECT value FROM config WHERE key='api_key'").first<any>();if(!row)return '';
+ try{
+  const p=JSON.parse(row.value);if(p.version!==undefined&&p.version!==2)throw new Error();
+  const secret=p.version===2?encryptionSecret():adminToken();if(!secret)throw new Error();
+  const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:new Uint8Array(p.iv)},await encryptionKey(secret),new Uint8Array(p.data));const value=new TextDecoder().decode(plain);
+  if(p.version!==2){
+   // Compare-and-swap: migration must never overwrite a concurrently updated key.
+   await database().prepare("UPDATE config SET value=? WHERE key='api_key' AND value=?").bind(await encryptedPayload(value),row.value).run();
+  }
+  return value;
+ }catch{throw new SecurityError('保存済みAPIキーを確認できません。管理者が接続設定を確認してください。',503);}
+}
+export async function identity(){const c=await cookies();const token=c.get('arika_access')?.value;if(!token)throw new Error('招待リンクまたは管理用リンクから開いてください。');if(adminToken()&&token===adminToken()){await requireAdministrator();return 'creator';}const row=await database().prepare('SELECT id FROM spaces WHERE invite=?').bind(token).first<any>();if(row)return 'viewer:'+row.id;throw new Error('リンクの有効期限が切れたか、共有が解除されました。新しい招待リンクから開いてください。');}
 export async function authorize(space:string,user:string){const d=database();if(user==='viewer:'+space){const s=await d.prepare('SELECT * FROM spaces WHERE id=?').bind(space).first<any>();if(s)return s;}const m=await d.prepare('SELECT s.* FROM spaces s JOIN members m ON s.id=m.space WHERE s.id=? AND m.user=?').bind(space,user).first<any>();if(!m)throw new Error('このスペースへのアクセス権がありません。');return m;}
 export function reply(data:unknown,status=200){return Response.json(data,{status,headers:{'Cache-Control':'no-store'}});}
-export function reject(e:unknown){const msg=e instanceof Error?e.message:'処理できませんでした。再試行してください。';return reply({error:msg},400);}
+export function reject(e:unknown){const msg=e instanceof Error?e.message:'処理できませんでした。再試行してください。';const status=e instanceof SecurityError?e.status:400;const response=reply({error:msg},status);if(e instanceof SecurityError&&e.retryAfter)response.headers.set('Retry-After',String(e.retryAfter));return response;}
 export function textValue(v:unknown,max=200){return typeof v==='string'?v.trim().slice(0,max):'';}
 export type Frame={id:string;time:number};
 export type Item={name:string;description:string;location:string;frame:number;box?:number[];source?:string;aliases?:string[];learnedQueries?:string[]};
@@ -28,14 +43,15 @@ export async function budgetSettings(){
  const saved=row?Number(row.value):cap;
  return {cap,limit:Number.isFinite(saved)&&saved>=0?Math.min(cap,saved):0};
 }
-export async function analyze(space:string,frames:Frame[],query=''){
+export async function analyze(space:string,frames:Frame[],query='',user='creator'){
  const key=await apiKey();if(!key)throw new Error('AI解析は未接続です。撮影の保存と手動メモは利用できます。');
  const d=database();const spaceRow=await d.prepare('SELECT owner FROM spaces WHERE id=?').bind(space).first<any>();const admin=await d.prepare("SELECT value FROM config WHERE key='admin'").first<any>();if(!admin||spaceRow?.owner!==admin.value)throw new Error('この組織の管理者が設定したスペースのみAIを利用できます。');
  if(frames.length<1||frames.length>12)throw new Error('画像は1〜12枚で解析してください。');
  const id=crypto.randomUUID(),reserve=visionReserve(frames.length),cap=budgetCap();
+ const release=await claimAiUsage(space,user);
  // Reserve all batches atomically before any request, including concurrent visitors.
- const held=await d.prepare("INSERT INTO ledger(id,space,kind,cost,status,created) SELECT ?,?,?,?,?,? WHERE (SELECT COALESCE(SUM(cost),0) FROM ledger)+?<=MIN(?,COALESCE(CAST((SELECT value FROM config WHERE key='budget_limit') AS REAL),?))").bind(id,space,query?'再解析':'初回解析',reserve,'reserved',new Date().toISOString(),reserve,cap,cap).run();
- if(!held.meta.changes)throw new Error('予算保護のためAIを停止しました。保存済みの記録は検索できます。');
+ let held;try{held=await d.prepare("INSERT INTO ledger(id,space,kind,cost,status,created) SELECT ?,?,?,?,?,? WHERE (SELECT COALESCE(SUM(cost),0) FROM ledger)+?<=MIN(?,COALESCE(CAST((SELECT value FROM config WHERE key='budget_limit') AS REAL),?))").bind(id,space,query?'再解析':'初回解析',reserve,'reserved',new Date().toISOString(),reserve,cap,cap).run();}catch(e){await release();throw e;}
+ if(!held.meta.changes){await release();throw new Error('予算保護のためAIを停止しました。保存済みの記録は検索できます。');}
  let cost=0,input=0,output=0,unconfirmed=false,inFlight=false;
  const objects:Item[]=[];
  try{
@@ -71,6 +87,29 @@ JSON形式 {"objects":[{"name":"マイク","aliases":["マイクロフォン","m
  }finally{
   // Keep unknown sent calls charged conservatively; release unsent batches.
   if(inFlight){cost+=VISION_BATCH_RESERVE;unconfirmed=true;}
-  await d.prepare('UPDATE ledger SET cost=?,input=?,output=?,status=? WHERE id=?').bind(cost,input,output,unconfirmed?'unconfirmed':'completed',id).run();
+  try{await d.prepare('UPDATE ledger SET cost=?,input=?,output=?,status=? WHERE id=?').bind(cost,input,output,unconfirmed?'unconfirmed':'completed',id).run();}finally{await release();}
  }
+}
+
+// Fixed-window counters and a per-space lease are stored in D1, not isolate memory.
+export async function enforceRate(scope:string,maximum:number,seconds:number){
+ const now=Math.floor(Date.now()/1000),window=Math.floor(now/seconds)*seconds;
+ const result=await database().prepare(`INSERT INTO rate_limits(scope,window_start,count) VALUES(?,?,1)
+ ON CONFLICT(scope) DO UPDATE SET window_start=excluded.window_start,
+ count=CASE WHEN rate_limits.window_start=excluded.window_start THEN rate_limits.count+1 ELSE 1 END
+ WHERE rate_limits.window_start!=excluded.window_start OR rate_limits.count<?`).bind(scope,window,maximum).run();
+ if(!result.meta.changes)throw new SecurityError('操作回数の上限に達しました。少し待って再試行してください。',429,seconds-(now-window));
+}
+async function claimAiUsage(space:string,user:string){
+ const d=database(),actor=await rateActor(user);
+ await enforceRate('ai-space:'+space+':minute',6,60);
+ await enforceRate('ai-space:'+space+':hour',60,3600);
+ await enforceRate('ai:'+space+':'+actor+':minute',3,60);
+ await enforceRate('ai:'+space+':'+actor+':hour',20,3600);
+ const id=crypto.randomUUID(),now=Date.now();
+ const lock=await d.prepare(`INSERT INTO ai_locks(space,token,expires) VALUES(?,?,?)
+ ON CONFLICT(space) DO UPDATE SET token=excluded.token,expires=excluded.expires WHERE ai_locks.expires<?`).bind(space,id,now+300000,now).run();
+ if(!lock.meta.changes)throw new SecurityError('このスペースのAI処理が進行中です。完了後に再試行してください。',429,15);
+ try{await d.prepare('DELETE FROM rate_limits WHERE window_start<?').bind(Math.floor(now/1000)-7200).run();}catch(e){await d.prepare('DELETE FROM ai_locks WHERE space=? AND token=?').bind(space,id).run();throw e;}
+ return async()=>{await d.prepare('DELETE FROM ai_locks WHERE space=? AND token=?').bind(space,id).run();};
 }
